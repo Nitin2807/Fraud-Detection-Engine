@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.env
+
+# Data & Models (NEVER commit these)
+*.csv
+models/
+*.pth
+*.bin
+
+# IDE settings
+.vscode/
+
+# MLflow logs
+mlruns/
