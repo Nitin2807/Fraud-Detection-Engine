@@ -56,12 +56,24 @@ def _prepare_runtime():
 
 
 def _build_spark_session() -> SparkSession:
+    # Keep Spark Python worker and driver on the same interpreter.
+    os.environ["PYSPARK_PYTHON"] = sys.executable
+    os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
+    # Force loopback networking to avoid host.docker.internal callback issues on Windows.
+    os.environ.setdefault("SPARK_LOCAL_HOSTNAME", "localhost")
+
     packages = ["org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0"]
     if OUTPUT_MODE == "mongodb":
         packages.append("org.mongodb.spark:mongo-spark-connector_2.12:10.2.1")
 
     return SparkSession.builder \
         .appName("FraudDetectionEngine") \
+        .master("local[*]") \
+        .config("spark.driver.host", "127.0.0.1") \
+        .config("spark.driver.bindAddress", "127.0.0.1") \
+        .config("spark.local.ip", "127.0.0.1") \
+        .config("spark.pyspark.python", sys.executable) \
+        .config("spark.pyspark.driver.python", sys.executable) \
         .config("spark.jars.packages", ",".join(packages)) \
         .getOrCreate()
 
@@ -97,7 +109,8 @@ class Autoencoder(nn.Module):
         target_sizes = reverse_sizes[1:] + [input_dim]
         for target_dim in target_sizes:
             decoder_layers.append(nn.Linear(current_dim, target_dim))
-            if target_dim != input_dim:
+            # Must mirror training model architecture exactly for state_dict compatibility.
+            if target_dim != num_layers - 1:
                 decoder_layers.append(nn.BatchNorm1d(target_dim))
                 decoder_layers.append(nn.ReLU())
                 decoder_layers.append(nn.Dropout(dropout_rate))
@@ -138,27 +151,32 @@ def score_batches(iterator: Iterator[pd.DataFrame]) -> Iterator[pd.DataFrame]:
             yield batch_df
             continue
 
-        # Data cleaning to match training pipeline.
-        batch_df = batch_df.copy()
-        batch_df['amount'] = batch_df['amount'].astype(str).str.replace(',', '', regex=False).astype(float)
-        batch_df['originBank'] = batch_df['originBank'].astype(str).str.upper()
-        batch_df.fillna("UNKNOWN", inplace=True)
+        # Keep raw frame for output schema compatibility (e.g., amount is StringType).
+        output_df = batch_df.copy()
+
+        # Clean a separate frame for model inference to avoid mutating output types.
+        infer_df = batch_df.copy()
+        infer_df['amount'] = infer_df['amount'].astype(str).str.replace(',', '', regex=False).astype(float)
+        infer_df['originBank'] = infer_df['originBank'].astype(str).str.upper()
+        infer_df.fillna("UNKNOWN", inplace=True)
 
         # Keep only model features and align strictly to training columns.
-        current_dummies = pd.get_dummies(batch_df[cat_cols], drop_first=True)
+        current_dummies = pd.get_dummies(infer_df[cat_cols], drop_first=True)
         feature_df = current_dummies.copy()
         for col_name in num_cols:
-            feature_df[col_name] = batch_df[col_name].astype(float)
+            feature_df[col_name] = infer_df[col_name].astype(float)
         feature_df = feature_df.reindex(columns=_feature_columns, fill_value=0.0)
         feature_df[num_cols] = _scaler.transform(feature_df[num_cols])
+        # Ensure homogeneous numeric dtype before torch conversion.
+        feature_matrix = feature_df.apply(pd.to_numeric, errors="coerce").fillna(0.0).to_numpy(dtype="float32")
 
         with torch.no_grad():
-            tensor_data = torch.FloatTensor(feature_df.values)
+            tensor_data = torch.from_numpy(feature_matrix)
             reconstructions = _model(tensor_data)
             loss = torch.mean((reconstructions - tensor_data) ** 2, dim=1).numpy()
 
-        batch_df["anomaly_score"] = loss
-        yield batch_df
+        output_df["anomaly_score"] = loss
+        yield output_df
 
 # --- MAIN PIPELINE ---
 if __name__ == "__main__":

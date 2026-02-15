@@ -103,3 +103,90 @@ And then paste full `spark_consumer.py` traceback.
 ## Suggested future cleanup
 - Pin `torch==2.5.1` in `requirements.txt` to avoid unstable wheel upgrades.
 - Optionally move consumer execution into Docker later to avoid Windows Spark/Hadoop friction.
+
+## Update (2026-02-16)
+
+### Current status
+- `FDE_env` is now healthy and usable.
+- Java in active terminal is correct:
+  - `JAVA_HOME=C:\Program Files\Eclipse Adoptium\jre-17.0.8.101-hotspot`
+  - `where java` shows Java 17 first.
+- Hadoop helper is present:
+  - `where winutils.exe` -> `C:\hadoop\bin\winutils.exe`
+
+### Root cause recap (final)
+- `HADOOP_HOME` had previously been persisted incorrectly as `%HADOOP_HOME%\\bin`.
+- VS Code terminal and standalone cmd were not always inheriting the same environment snapshot.
+- Some earlier runs used wrong Python interpreter and wrong Java (JDK 25), causing Spark startup failures.
+
+### Verified-good checks before running consumer
+Run these in the same terminal where you run Spark:
+```cmd
+conda activate FDE_env
+echo %JAVA_HOME%
+where java
+where winutils.exe
+python -c "import os; print(os.environ.get('JAVA_HOME')); print(os.environ.get('HADOOP_HOME')); import torch,pyspark,pyarrow; print(torch.__version__, pyspark.__version__, pyarrow.__version__)"
+```
+
+### Run sequence
+Terminal 1:
+```cmd
+python "D:\Fraud Detection Engine\src\processing\spark_consumer.py"
+```
+Terminal 2:
+```cmd
+python "D:\Fraud Detection Engine\src\ingestion\stream_generator.py"
+```
+
+### If Spark fails again
+Paste output of:
+```cmd
+echo %JAVA_HOME%
+echo %HADOOP_HOME%
+where java
+where winutils.exe
+python -c "import os; print(os.environ.get('JAVA_HOME')); print(os.environ.get('HADOOP_HOME'))"
+```
+
+## Update (2026-02-16 - Working State Achieved)
+
+### Status
+- End-to-end streaming now works.
+- `spark_consumer.py` successfully reads from Kafka topic and scores messages.
+- `stream_generator.py` producer is publishing and consumer is receiving.
+
+### Final blockers resolved
+1. Windows Spark runtime and env mismatch issues
+- Fixed Java mismatch (using Java 17 for Spark 3.5).
+- Fixed broken historical `HADOOP_HOME` values.
+- Added/verified `winutils.exe` setup.
+- Enforced local driver binding in Spark (`127.0.0.1`) to avoid Python worker callback timeout.
+
+2. Interpreter consistency
+- Ensured Spark driver/worker use the same Python interpreter (`FDE_env`) in `spark_consumer.py`.
+
+3. Model loading mismatch
+- Consumer `Autoencoder` decoder architecture was aligned with training model shape so `state_dict` loads.
+
+4. Pandas/Arrow output schema mismatch
+- Kept raw output frame types intact for Spark schema (`amount` remains string in output).
+- Used separate cleaned frame for inference only.
+
+5. Tensor conversion dtype failure
+- Forced final model feature matrix to strict numeric `float32` before creating torch tensor.
+
+### Current recommended run flow
+Terminal 1:
+```cmd
+conda run -n FDE_env python "D:\Fraud Detection Engine\src\processing\spark_consumer.py"
+```
+Terminal 2:
+```cmd
+conda run -n FDE_env python "D:\Fraud Detection Engine\src\ingestion\stream_generator.py"
+```
+
+### Tomorrow focus areas
+- Walk through full data flow: Kafka -> Spark parse -> feature alignment -> scaler -> autoencoder -> anomaly score.
+- Define anomaly thresholding and alerting policy for scores.
+- Add lightweight logging/checkpoint strategy for reliable restarts.
