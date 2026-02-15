@@ -22,8 +22,6 @@ except Exception as e:
     print(f"❌ Failed to connect to Kafka: {e}")
     exit()
 
-# --- Data Profiles (Global Scope) ---
-
 # 1. Geographic Profiles
 COUNTRIES_TRUSTED = ['India', 'USA', 'UK', 'Germany', 'Japan', 'Singapore']
 COUNTRIES_HIGH_RISK = ['Panama', 'Russia', 'Cayman Islands', 'North Korea', 'Nigeria']

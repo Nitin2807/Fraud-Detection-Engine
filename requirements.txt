@@ -4,5 +4,7 @@ numpy
 scikit-learn
 optuna
 mlflow
-kafka
+kafka-python
 faker
+pyspark==3.5.0
+pyarrow>=12,<16
