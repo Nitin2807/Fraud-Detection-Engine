@@ -8,3 +8,4 @@ kafka-python
 faker
 pyspark==3.5.0
 pyarrow>=12,<16
+python-dotenv

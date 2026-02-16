@@ -1,5 +1,5 @@
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import from_json, col
+from pyspark.sql.functions import from_json, col, when, lit
 from pyspark.sql.types import StructType, StructField, StringType, DoubleType
 import pandas as pd
 import torch
@@ -10,7 +10,10 @@ import os
 import re
 import subprocess
 import sys
+import json
+import warnings
 from typing import Iterator
+from sklearn.exceptions import InconsistentVersionWarning
 
 # --- CONFIGURATION ---
 OUTPUT_MODE = "console" 
@@ -24,6 +27,19 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 MODEL_PATH = PROJECT_ROOT / "models" / "best_autoencoder.pth"
 SCALER_PATH = PROJECT_ROOT / "models" / "std_scaler.bin"
 COLUMNS_PATH = PROJECT_ROOT / "models" / "model_columns.bin"
+THRESHOLD_PATH = PROJECT_ROOT / "src" / "results" / "threshold.json"
+DEFAULT_ANOMALY_THRESHOLD = 0.10
+
+
+def _load_threshold() -> float:
+    if not THRESHOLD_PATH.exists():
+        return DEFAULT_ANOMALY_THRESHOLD
+    try:
+        with open(THRESHOLD_PATH, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        return float(payload.get("selected_threshold", DEFAULT_ANOMALY_THRESHOLD))
+    except Exception:
+        return DEFAULT_ANOMALY_THRESHOLD
 
 def _get_java_major() -> int:
     java_home = os.environ.get("JAVA_HOME")
@@ -59,12 +75,20 @@ def _build_spark_session() -> SparkSession:
     # Keep Spark Python worker and driver on the same interpreter.
     os.environ["PYSPARK_PYTHON"] = sys.executable
     os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
+    # Ensure Spark worker processes can import the local `src` package.
+    current_pythonpath = os.environ.get("PYTHONPATH", "")
+    project_root_str = str(PROJECT_ROOT)
+    if project_root_str not in current_pythonpath.split(os.pathsep):
+        os.environ["PYTHONPATH"] = (
+            project_root_str if not current_pythonpath else project_root_str + os.pathsep + current_pythonpath
+        )
     # Force loopback networking to avoid host.docker.internal callback issues on Windows.
     os.environ.setdefault("SPARK_LOCAL_HOSTNAME", "localhost")
 
-    packages = ["org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0"]
-    if OUTPUT_MODE == "mongodb":
-        packages.append("org.mongodb.spark:mongo-spark-connector_2.12:10.2.1")
+    packages = [
+        "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0",
+        "org.mongodb.spark:mongo-spark-connector_2.12:10.3.0",
+    ]
 
     return SparkSession.builder \
         .appName("FraudDetectionEngine") \
@@ -74,14 +98,21 @@ def _build_spark_session() -> SparkSession:
         .config("spark.local.ip", "127.0.0.1") \
         .config("spark.pyspark.python", sys.executable) \
         .config("spark.pyspark.driver.python", sys.executable) \
+        .config("spark.executorEnv.PYTHONPATH", os.environ["PYTHONPATH"]) \
         .config("spark.jars.packages", ",".join(packages)) \
         .getOrCreate()
 
 
-_prepare_runtime()
-spark = _build_spark_session()
+spark = None
 
-spark.sparkContext.setLogLevel("ERROR")
+
+def _get_spark() -> SparkSession:
+    global spark
+    if spark is None:
+        _prepare_runtime()
+        spark = _build_spark_session()
+        spark.sparkContext.setLogLevel("ERROR")
+    return spark
 
 # --- MODEL CLASS ---
 class Autoencoder(nn.Module):
@@ -125,18 +156,28 @@ _scaler = None
 _feature_columns = None
 
 
+def _load_scaler_with_refresh(path: Path):
+    # If sklearn version changed, load once and re-save to current runtime version.
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", InconsistentVersionWarning)
+        scaler = joblib.load(path)
+    if any(isinstance(w.message, InconsistentVersionWarning) for w in caught):
+        joblib.dump(scaler, path)
+    return scaler
+
+
 def _load_inference_artifacts():
     global _model, _scaler, _feature_columns
     if _model is not None:
         return
 
     device = torch.device("cpu")
-    _scaler = joblib.load(SCALER_PATH)
+    _scaler = _load_scaler_with_refresh(SCALER_PATH)
     _feature_columns = joblib.load(COLUMNS_PATH)
     input_dim = len(_feature_columns)
 
     _model = Autoencoder(input_dim=input_dim, output_neurons_layer=96, dropout_rate=0.1, num_layers=1)
-    _model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
+    _model.load_state_dict(torch.load(MODEL_PATH, map_location=device, weights_only=True))
     _model.eval()
 
 
@@ -178,10 +219,15 @@ def score_batches(iterator: Iterator[pd.DataFrame]) -> Iterator[pd.DataFrame]:
         output_df["anomaly_score"] = loss
         yield output_df
 
-# --- MAIN PIPELINE ---
-if __name__ == "__main__":
+def get_scored_stream():
+    """
+    Reads Kafka, parses JSON, applies the Autoencoder, 
+    and returns the streaming DataFrame with anomaly scores.
+    """
+    spark_session = _get_spark()
+
     # 1. READ KAFKA
-    df_raw = spark.readStream \
+    df_raw = spark_session.readStream \
         .format("kafka") \
         .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP) \
         .option("subscribe", KAFKA_TOPIC) \
@@ -208,27 +254,18 @@ if __name__ == "__main__":
     
     df_parsed = df_raw.select(from_json(col("value").cast("string"), schema).alias("data")).select("data.*")
 
-    # 3. APPLY AI MODEL
+    # 3. APPLY AI MODEL (batch scoring via mapInPandas)
     output_schema = StructType(schema.fields + [StructField("anomaly_score", DoubleType())])
     df_scored = df_parsed.mapInPandas(score_batches, schema=output_schema)
 
-    # 4. WRITE STREAM
-    if OUTPUT_MODE == "console":
-        print("🚀 Writing to Console...")
-        query = df_scored.writeStream \
-            .outputMode("append") \
-            .format("console") \
-            .start()
-            
-    elif OUTPUT_MODE == "mongodb":
-        print(f"🚀 Writing to MongoDB Atlas: {MONGO_DB}.{MONGO_COLLECTION}")
-        query = df_scored.writeStream \
-            .format("mongodb") \
-            .option("checkpointLocation", "/tmp/pyspark_checkpoint") \
-            .option("spark.mongodb.connection.uri", MONGO_URI) \
-            .option("spark.mongodb.database", MONGO_DB) \
-            .option("spark.mongodb.collection", MONGO_COLLECTION) \
-            .outputMode("append") \
-            .start()
+    threshold = _load_threshold()
+    high_threshold = threshold * 1.5
+    df_scored = df_scored \
+        .withColumn("is_fraud_transaction", (col("anomaly_score") >= lit(high_threshold)).cast("int")) \
+        .withColumn("is_suspected_fraud", (col("anomaly_score") >= lit(high_threshold)).cast("int")) \
+        .withColumn(
+            "risk_band",
+            when(col("anomaly_score") >= lit(high_threshold), lit("high")).otherwise(lit("low"))
+        )
 
-    query.awaitTermination()
+    return df_scored

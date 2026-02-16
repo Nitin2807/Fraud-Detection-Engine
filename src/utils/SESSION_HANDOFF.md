@@ -190,3 +190,30 @@ conda run -n FDE_env python "D:\Fraud Detection Engine\src\ingestion\stream_gene
 - Walk through full data flow: Kafka -> Spark parse -> feature alignment -> scaler -> autoencoder -> anomaly score.
 - Define anomaly thresholding and alerting policy for scores.
 - Add lightweight logging/checkpoint strategy for reliable restarts.
+
+## Update (2026-02-16 - Evaluation + Mongo Pipeline Refactor)
+
+### What was implemented
+- Added offline evaluation script: `src/results/evaluate_autoencoder.py`
+- Added recall-constrained threshold selection (target recall = 0.95).
+- Saved artifacts to `src/results/`:
+  - `threshold.json`
+  - `metrics.json`
+  - `threshold_sweep.csv`
+  - `scored_holdout.csv`
+  - `metrics_summary.md`
+- Updated stream inference (`src/processing/spark_consumer.py`) to:
+  - load threshold from `src/results/threshold.json`
+  - add `is_suspected_fraud`
+  - add `risk_band` (`low` / `medium` / `high`)
+- Updated `src/results/mongo_writer.py` to read Mongo URI from `.env` key `uri`.
+- Added `python-dotenv` to `requirements.txt`.
+- Replaced empty `README.md` with architecture + run + evaluation documentation.
+
+### Smoke test result
+- `evaluate_autoencoder.py` ran successfully in `FDE_env` and generated all artifacts.
+- Selected threshold (current run): `0.15471555782343915`
+
+### Important caveat
+- Scaler load warning appeared due sklearn version mismatch (artifact saved with 1.7.2, runtime 1.8.0).
+- Action recommended: retrain/resave scaler + model artifacts in the current environment version for strict reproducibility.
