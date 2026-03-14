@@ -1,45 +1,74 @@
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import from_json, col, when, lit
-from pyspark.sql.types import StructType, StructField, StringType, DoubleType
-import pandas as pd
-import torch
-import torch.nn as nn
-import joblib
-from pathlib import Path
+﻿from __future__ import annotations
+
+import json
 import os
 import re
 import subprocess
 import sys
-import json
 import warnings
+from pathlib import Path
 from typing import Iterator
+
+import joblib
+import pandas as pd
+import torch
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, from_json, lit, when
+from pyspark.sql.types import DoubleType, StringType, StructField, StructType
 from sklearn.exceptions import InconsistentVersionWarning
 
-# --- CONFIGURATION ---
-OUTPUT_MODE = "console" 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.append(str(PROJECT_ROOT))
+
+from src.training.model import Autoencoder
+from src.utils.feature_pipeline import transform_with_artifacts
+
+
 KAFKA_BOOTSTRAP = "localhost:9092"
 KAFKA_TOPIC = "financial_transactions"
-MONGO_URI = "mongodb+srv://<YOUR_USER>:<YOUR_PASSWORD>@<YOUR_CLUSTER>.mongodb.net/?retryWrites=true&w=majority"
-MONGO_DB = "fraud_detection"
-MONGO_COLLECTION = "transactions"
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
 MODEL_PATH = PROJECT_ROOT / "models" / "best_autoencoder.pth"
 SCALER_PATH = PROJECT_ROOT / "models" / "std_scaler.bin"
 COLUMNS_PATH = PROJECT_ROOT / "models" / "model_columns.bin"
+MODEL_CONFIG_PATH = PROJECT_ROOT / "models" / "model_config.json"
 THRESHOLD_PATH = PROJECT_ROOT / "src" / "results" / "threshold.json"
+
 DEFAULT_ANOMALY_THRESHOLD = 0.10
+DEFAULT_MODEL_CONFIG = {
+    "start_neurons": 96,
+    "dropout": 0.1,
+    "num_layers": 1,
+}
 
 
 def _load_threshold() -> float:
     if not THRESHOLD_PATH.exists():
         return DEFAULT_ANOMALY_THRESHOLD
+
     try:
-        with open(THRESHOLD_PATH, "r", encoding="utf-8") as f:
-            payload = json.load(f)
+        payload = json.loads(THRESHOLD_PATH.read_text(encoding="utf-8"))
         return float(payload.get("selected_threshold", DEFAULT_ANOMALY_THRESHOLD))
     except Exception:
         return DEFAULT_ANOMALY_THRESHOLD
+
+
+def _load_model_config() -> dict:
+    if not MODEL_CONFIG_PATH.exists():
+        return DEFAULT_MODEL_CONFIG.copy()
+
+    payload = json.loads(MODEL_CONFIG_PATH.read_text(encoding="utf-8"))
+    merged = DEFAULT_MODEL_CONFIG.copy()
+    merged.update(payload)
+    return merged
+
+
+def _torch_load_state_dict(path: Path):
+    try:
+        return torch.load(path, map_location=torch.device("cpu"), weights_only=True)
+    except TypeError:
+        return torch.load(path, map_location=torch.device("cpu"))
+
 
 def _get_java_major() -> int:
     java_home = os.environ.get("JAVA_HOME")
@@ -48,19 +77,17 @@ def _get_java_major() -> int:
         proc = subprocess.run([java_cmd, "-version"], capture_output=True, text=True, check=False)
     except OSError:
         return -1
+
     output = f"{proc.stdout}\n{proc.stderr}"
     match = re.search(r'"(\d+)(?:\.\d+)*"', output)
     return int(match.group(1)) if match else -1
 
 
-def _prepare_runtime():
-    # Some Windows setups accidentally store HADOOP_HOME as "%HADOOP_HOME%\bin";
-    # remove that invalid value so Spark doesn't try to use it.
+def _prepare_runtime() -> None:
     hadoop_home = os.environ.get("HADOOP_HOME", "")
     if "%" in hadoop_home:
         os.environ.pop("HADOOP_HOME", None)
 
-    # Spark 3.5.x is not compatible with very new JDKs (e.g., 21+ / 25).
     java_major = _get_java_major()
     if java_major == -1:
         raise RuntimeError("Java was not found. Install Java 17 and set JAVA_HOME accordingly.")
@@ -72,17 +99,16 @@ def _prepare_runtime():
 
 
 def _build_spark_session() -> SparkSession:
-    # Keep Spark Python worker and driver on the same interpreter.
     os.environ["PYSPARK_PYTHON"] = sys.executable
     os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
-    # Ensure Spark worker processes can import the local `src` package.
+
     current_pythonpath = os.environ.get("PYTHONPATH", "")
     project_root_str = str(PROJECT_ROOT)
     if project_root_str not in current_pythonpath.split(os.pathsep):
         os.environ["PYTHONPATH"] = (
             project_root_str if not current_pythonpath else project_root_str + os.pathsep + current_pythonpath
         )
-    # Force loopback networking to avoid host.docker.internal callback issues on Windows.
+
     os.environ.setdefault("SPARK_LOCAL_HOSTNAME", "localhost")
 
     packages = [
@@ -90,17 +116,18 @@ def _build_spark_session() -> SparkSession:
         "org.mongodb.spark:mongo-spark-connector_2.12:10.3.0",
     ]
 
-    return SparkSession.builder \
-        .appName("FraudDetectionEngine") \
-        .master("local[*]") \
-        .config("spark.driver.host", "127.0.0.1") \
-        .config("spark.driver.bindAddress", "127.0.0.1") \
-        .config("spark.local.ip", "127.0.0.1") \
-        .config("spark.pyspark.python", sys.executable) \
-        .config("spark.pyspark.driver.python", sys.executable) \
-        .config("spark.executorEnv.PYTHONPATH", os.environ["PYTHONPATH"]) \
-        .config("spark.jars.packages", ",".join(packages)) \
+    return (
+        SparkSession.builder.appName("FraudDetectionEngine")
+        .master("local[*]")
+        .config("spark.driver.host", "127.0.0.1")
+        .config("spark.driver.bindAddress", "127.0.0.1")
+        .config("spark.local.ip", "127.0.0.1")
+        .config("spark.pyspark.python", sys.executable)
+        .config("spark.pyspark.driver.python", sys.executable)
+        .config("spark.executorEnv.PYTHONPATH", os.environ["PYTHONPATH"])
+        .config("spark.jars.packages", ",".join(packages))
         .getOrCreate()
+    )
 
 
 spark = None
@@ -114,42 +141,6 @@ def _get_spark() -> SparkSession:
         spark.sparkContext.setLogLevel("ERROR")
     return spark
 
-# --- MODEL CLASS ---
-class Autoencoder(nn.Module):
-    def __init__(self, input_dim, output_neurons_layer, dropout_rate, num_layers):
-        super(Autoencoder, self).__init__()
-        # Encoder
-        encoder_layers = []
-        current_dim = input_dim
-        next_dim = output_neurons_layer
-        self.layer_sizes = [] 
-        for i in range(num_layers):
-            encoder_layers.append(nn.Linear(current_dim, next_dim))
-            encoder_layers.append(nn.BatchNorm1d(next_dim))
-            encoder_layers.append(nn.ReLU())
-            encoder_layers.append(nn.Dropout(dropout_rate))
-            self.layer_sizes.append(next_dim)
-            current_dim = next_dim
-            next_dim = max(5, next_dim // 2) 
-        self.encoder = nn.Sequential(*encoder_layers)
-        
-        # Decoder
-        decoder_layers = []
-        reverse_sizes = self.layer_sizes[::-1] 
-        current_dim = self.layer_sizes[-1] 
-        target_sizes = reverse_sizes[1:] + [input_dim]
-        for target_dim in target_sizes:
-            decoder_layers.append(nn.Linear(current_dim, target_dim))
-            # Must mirror training model architecture exactly for state_dict compatibility.
-            if target_dim != num_layers - 1:
-                decoder_layers.append(nn.BatchNorm1d(target_dim))
-                decoder_layers.append(nn.ReLU())
-                decoder_layers.append(nn.Dropout(dropout_rate))
-            current_dim = target_dim
-        self.decoder = nn.Sequential(*decoder_layers)
-
-    def forward(self, x):
-        return self.decoder(self.encoder(x))
 
 _model = None
 _scaler = None
@@ -157,7 +148,6 @@ _feature_columns = None
 
 
 def _load_scaler_with_refresh(path: Path):
-    # If sklearn version changed, load once and re-save to current runtime version.
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always", InconsistentVersionWarning)
         scaler = joblib.load(path)
@@ -166,50 +156,47 @@ def _load_scaler_with_refresh(path: Path):
     return scaler
 
 
-def _load_inference_artifacts():
+def _load_inference_artifacts() -> None:
     global _model, _scaler, _feature_columns
+
     if _model is not None:
         return
 
-    device = torch.device("cpu")
+    if not MODEL_PATH.exists():
+        raise FileNotFoundError(f"Model file missing: {MODEL_PATH}")
+    if not SCALER_PATH.exists():
+        raise FileNotFoundError(f"Scaler file missing: {SCALER_PATH}")
+    if not COLUMNS_PATH.exists():
+        raise FileNotFoundError(f"Feature column file missing: {COLUMNS_PATH}")
+
+    model_config = _load_model_config()
+
     _scaler = _load_scaler_with_refresh(SCALER_PATH)
     _feature_columns = joblib.load(COLUMNS_PATH)
-    input_dim = len(_feature_columns)
 
-    _model = Autoencoder(input_dim=input_dim, output_neurons_layer=96, dropout_rate=0.1, num_layers=1)
-    _model.load_state_dict(torch.load(MODEL_PATH, map_location=device, weights_only=True))
+    _model = Autoencoder(
+        input_dim=len(_feature_columns),
+        output_neurons_layer=int(model_config["start_neurons"]),
+        dropout_rate=float(model_config["dropout"]),
+        num_layers=int(model_config["num_layers"]),
+    )
+    _model.load_state_dict(_torch_load_state_dict(MODEL_PATH))
     _model.eval()
 
 
 def score_batches(iterator: Iterator[pd.DataFrame]) -> Iterator[pd.DataFrame]:
     _load_inference_artifacts()
-    num_cols = ['amount', 'oldBalanceOrg', 'newBalanceOrg', 'oldBalanceDest', 'newBalanceDest']
-    cat_cols = ['type', 'currency', 'originBank', 'originCountry', 'destBank', 'destCountry']
 
     for batch_df in iterator:
         if batch_df.empty:
-            batch_df["anomaly_score"] = []
-            yield batch_df
+            empty_df = batch_df.copy()
+            empty_df["anomaly_score"] = pd.Series(dtype="float64")
+            yield empty_df
             continue
 
-        # Keep raw frame for output schema compatibility (e.g., amount is StringType).
         output_df = batch_df.copy()
-
-        # Clean a separate frame for model inference to avoid mutating output types.
-        infer_df = batch_df.copy()
-        infer_df['amount'] = infer_df['amount'].astype(str).str.replace(',', '', regex=False).astype(float)
-        infer_df['originBank'] = infer_df['originBank'].astype(str).str.upper()
-        infer_df.fillna("UNKNOWN", inplace=True)
-
-        # Keep only model features and align strictly to training columns.
-        current_dummies = pd.get_dummies(infer_df[cat_cols], drop_first=True)
-        feature_df = current_dummies.copy()
-        for col_name in num_cols:
-            feature_df[col_name] = infer_df[col_name].astype(float)
-        feature_df = feature_df.reindex(columns=_feature_columns, fill_value=0.0)
-        feature_df[num_cols] = _scaler.transform(feature_df[num_cols])
-        # Ensure homogeneous numeric dtype before torch conversion.
-        feature_matrix = feature_df.apply(pd.to_numeric, errors="coerce").fillna(0.0).to_numpy(dtype="float32")
+        feature_df = transform_with_artifacts(batch_df, _scaler, _feature_columns)
+        feature_matrix = feature_df.to_numpy(dtype="float32")
 
         with torch.no_grad():
             tensor_data = torch.from_numpy(feature_matrix)
@@ -219,53 +206,54 @@ def score_batches(iterator: Iterator[pd.DataFrame]) -> Iterator[pd.DataFrame]:
         output_df["anomaly_score"] = loss
         yield output_df
 
+
 def get_scored_stream():
-    """
-    Reads Kafka, parses JSON, applies the Autoencoder, 
-    and returns the streaming DataFrame with anomaly scores.
-    """
     spark_session = _get_spark()
 
-    # 1. READ KAFKA
-    df_raw = spark_session.readStream \
-        .format("kafka") \
-        .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP) \
-        .option("subscribe", KAFKA_TOPIC) \
-        .option("startingOffsets", "latest") \
-        .option("failOnDataLoss", "false") \
+    df_raw = (
+        spark_session.readStream.format("kafka")
+        .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP)
+        .option("subscribe", KAFKA_TOPIC)
+        .option("startingOffsets", "latest")
+        .option("failOnDataLoss", "false")
         .load()
+    )
 
-    # 2. PARSE JSON
-    schema = StructType([
-        StructField("transactionId", StringType()),
-        StructField("amount", StringType()), 
-        StructField("type", StringType()),
-        StructField("currency", StringType()),
-        StructField("oldBalanceOrg", DoubleType()),
-        StructField("newBalanceOrg", DoubleType()),
-        StructField("oldBalanceDest", DoubleType()),
-        StructField("newBalanceDest", DoubleType()),
-        StructField("originBank", StringType()),
-        StructField("destBank", StringType()),
-        StructField("originCountry", StringType()),
-        StructField("destCountry", StringType()),
-        StructField("timestamp", StringType())
-    ])
-    
+    schema = StructType(
+        [
+            StructField("transactionId", StringType()),
+            StructField("amount", StringType()),
+            StructField("type", StringType()),
+            StructField("currency", StringType()),
+            StructField("oldBalanceOrg", DoubleType()),
+            StructField("newBalanceOrg", DoubleType()),
+            StructField("oldBalanceDest", DoubleType()),
+            StructField("newBalanceDest", DoubleType()),
+            StructField("originBank", StringType()),
+            StructField("destBank", StringType()),
+            StructField("originCountry", StringType()),
+            StructField("destCountry", StringType()),
+            StructField("timestamp", StringType()),
+        ]
+    )
+
     df_parsed = df_raw.select(from_json(col("value").cast("string"), schema).alias("data")).select("data.*")
 
-    # 3. APPLY AI MODEL (batch scoring via mapInPandas)
     output_schema = StructType(schema.fields + [StructField("anomaly_score", DoubleType())])
     df_scored = df_parsed.mapInPandas(score_batches, schema=output_schema)
 
     threshold = _load_threshold()
     high_threshold = threshold * 1.5
-    df_scored = df_scored \
-        .withColumn("is_fraud_transaction", (col("anomaly_score") >= lit(high_threshold)).cast("int")) \
-        .withColumn("is_suspected_fraud", (col("anomaly_score") >= lit(high_threshold)).cast("int")) \
+
+    df_scored = (
+        df_scored.withColumn("is_fraud_transaction", (col("anomaly_score") >= lit(high_threshold)).cast("int"))
+        .withColumn("is_suspected_fraud", (col("anomaly_score") >= lit(high_threshold)).cast("int"))
         .withColumn(
             "risk_band",
-            when(col("anomaly_score") >= lit(high_threshold), lit("high")).otherwise(lit("low"))
+            when(col("anomaly_score") >= lit(high_threshold), lit("high"))
+            .when(col("anomaly_score") >= lit(threshold), lit("medium"))
+            .otherwise(lit("low")),
         )
+    )
 
     return df_scored

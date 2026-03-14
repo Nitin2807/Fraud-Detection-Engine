@@ -3,60 +3,41 @@
 Real-time fraud detection pipeline using Kafka, Spark Structured Streaming, and a PyTorch Autoencoder.
 
 ## What This Project Does
-- Streams synthetic global financial transactions into Kafka.
-- Scores each transaction with an Autoencoder reconstruction loss.
-- Flags high-loss transactions as suspected fraud using a threshold artifact.
-- Writes scored stream records to MongoDB Atlas.
+- Generates synthetic transaction data with balance-consistent transaction types (`CASH_IN`, `CASH_OUT`).
+- Trains an Autoencoder on normal transactions.
+- Scores live Kafka stream events with reconstruction loss (`anomaly_score`).
+- Flags only high-risk events as fraud and writes scored records to MongoDB Atlas.
 
 ## Architecture
 ```mermaid
 flowchart LR
-    A[Transaction Generator\n`src/ingestion/stream_generator.py`] -->|Kafka topic: financial_transactions| B[Kafka Broker]
-    B --> C[Spark Structured Streaming\n`src/processing/spark_consumer.py`]
-    C --> D[Autoencoder Inference\nPyTorch + Scaler + Feature Columns]
-    D --> E[Scored Stream\n`anomaly_score`, `is_suspected_fraud`, `risk_band`]
+    A[Generator\n`src/ingestion/stream_generator.py`] -->|Kafka topic: financial_transactions| B[Kafka]
+    B --> C[Spark Streaming\n`src/processing/spark_consumer.py`]
+    C --> D[Autoencoder Inference\nPyTorch + scaler + model columns]
+    D --> E[Scored Events\nanomaly_score, risk_band, is_fraud_transaction]
     E --> F[Mongo Writer\n`src/results/mongo_writer.py`]
     F --> G[(MongoDB Atlas)]
 
-    H[Offline Evaluation\n`src/results/evaluate_autoencoder.py`] --> I[`src/results/threshold.json`]
+    H[Offline Eval\n`src/results/evaluate_autoencoder.py`] --> I[`src/results/threshold.json`]
     I --> C
 ```
 
 ## Repository Structure
-- `src/ingestion/generate_dataset.py`: Generates `training_data.csv` with labels and data-quality noise.
-- `src/ingestion/stream_generator.py`: Kafka producer for live synthetic transaction stream.
-- `src/processing/spark_consumer.py`: Kafka consumer + Autoencoder scoring stream.
+- `src/ingestion/transaction_logic.py`: Shared synthetic transaction logic used by both dataset and live stream generation.
+- `src/ingestion/generate_dataset.py`: Regenerates `training_data.csv` at project root.
+- `src/ingestion/stream_generator.py`: Kafka producer for live synthetic transactions.
+- `src/processing/preprocessed.py`: Training preprocessing + scaler/column artifact generation.
+- `src/training/best_model.py`: Retrains the production autoencoder and saves model config.
+- `src/processing/spark_consumer.py`: Kafka consumer + Spark scoring stream.
+- `src/results/evaluate_autoencoder.py`: Holdout metrics + threshold artifacts.
 - `src/results/mongo_writer.py`: Writes scored stream to MongoDB.
-- `src/results/evaluate_autoencoder.py`: Builds evaluation artifacts and threshold.
-- `src/utils/artifacts.py`: Regenerates model artifacts (`std_scaler.bin`, `model_columns.bin`, model structure).
 
-## Data and Model
-- Dataset: `training_data.csv` (synthetic transactions with `is_anomaly` label).
-- Model type: Autoencoder trained on normal behavior.
-- Fraud signal: Higher reconstruction error (`anomaly_score`) indicates out-of-pattern behavior.
+## Data Logic Fix (Important)
+`type` is now tied to balance transitions:
+- `CASH_OUT`: `newBalanceOrg = oldBalanceOrg - amount`, `newBalanceDest = oldBalanceDest + amount`
+- `CASH_IN`: `newBalanceOrg = oldBalanceOrg + amount`, `newBalanceDest = oldBalanceDest - amount`
 
-## Evaluation Artifacts
-Run:
-```cmd
-conda run -n FDE_env python "D:\Fraud Detection Engine\src\results\evaluate_autoencoder.py"
-```
-
-This writes to `src/results/`:
-- `threshold.json`: recall-constrained threshold (target recall = 0.95).
-- `metrics.json`: precision, recall, F1, accuracy, PR-AUC, ROC-AUC, confusion matrix.
-- `threshold_sweep.csv`: threshold vs precision/recall/F1 table.
-- `scored_holdout.csv`: holdout rows with score and predicted label.
-- `metrics_summary.md`: readable metrics summary.
-
-## Streaming Decision Logic
-In stream inference (`src/processing/spark_consumer.py`):
-- `is_suspected_fraud = anomaly_score >= selected_threshold`
-- `risk_band`:
-  - `low` if below threshold
-  - `medium` if between `threshold` and `1.5 * threshold`
-  - `high` if above `1.5 * threshold`
-
-If `threshold.json` is missing, a safe fallback threshold is used.
+This removes the earlier mismatch where transaction type was random but balances were not type-aware.
 
 ## Setup
 1. Activate env and install dependencies:
@@ -64,21 +45,47 @@ If `threshold.json` is missing, a safe fallback threshold is used.
 conda activate FDE_env
 pip install -r "D:\Fraud Detection Engine\requirements.txt"
 ```
-2. Ensure Java 17 + Hadoop/winutils are configured in your session.
-3. Ensure Kafka is running from `docker-compose.yml`.
+2. Ensure Java 17 and Hadoop/winutils are configured in the current terminal.
+3. Start Kafka using `docker-compose.yml`.
 
-## Run Pipeline
-Terminal 1 (consumer + scoring + Mongo sink):
+## Full Rebuild Workflow
+Run in this order after changing data logic:
+
+1. Regenerate dataset:
+```cmd
+conda run -n FDE_env python "D:\Fraud Detection Engine\src\ingestion\generate_dataset.py"
+```
+
+2. Retrain model + regenerate scaler/feature artifacts:
+```cmd
+conda run -n FDE_env python "D:\Fraud Detection Engine\src\training\best_model.py"
+```
+
+3. Recompute evaluation and threshold artifacts:
+```cmd
+conda run -n FDE_env python "D:\Fraud Detection Engine\src\results\evaluate_autoencoder.py"
+```
+
+4. Start streaming writer (Spark + Mongo sink):
 ```cmd
 conda run -n FDE_env python "D:\Fraud Detection Engine\src\results\mongo_writer.py"
 ```
 
-Terminal 2 (producer):
+5. In another terminal, start producer:
 ```cmd
 conda run -n FDE_env python "D:\Fraud Detection Engine\src\ingestion\stream_generator.py"
 ```
 
+## Streaming Decision Logic
+- Base threshold is read from `src/results/threshold.json` (`selected_threshold`).
+- `risk_band`:
+  - `low`: score below threshold
+  - `medium`: score between threshold and `1.5 * threshold`
+  - `high`: score above `1.5 * threshold`
+- Fraud flag:
+  - `is_fraud_transaction = 1` only for `high` risk.
+
 ## Notes
 - `.env` should contain Mongo URI as key `uri`.
-- `training_data.csv` is synthetic and can be regenerated.
-- This project currently prioritizes backend/data-science pipeline over frontend.
+- `training_data.csv`, `models/`, and `.csv` outputs are git-ignored on purpose.
+- Current focus is data + ML + streaming pipeline; frontend can be added later.

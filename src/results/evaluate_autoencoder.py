@@ -1,4 +1,7 @@
-﻿import json
+﻿from __future__ import annotations
+
+import json
+import sys
 import warnings
 from pathlib import Path
 
@@ -6,7 +9,6 @@ import joblib
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn as nn
 from sklearn.exceptions import InconsistentVersionWarning
 from sklearn.metrics import (
     accuracy_score,
@@ -19,74 +21,49 @@ from sklearn.metrics import (
 )
 from sklearn.model_selection import train_test_split
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.append(str(PROJECT_ROOT))
+
+from src.training.model import Autoencoder
+from src.utils.feature_pipeline import transform_with_artifacts
+
 DATA_PATH = PROJECT_ROOT / "training_data.csv"
 MODEL_PATH = PROJECT_ROOT / "models" / "best_autoencoder.pth"
 SCALER_PATH = PROJECT_ROOT / "models" / "std_scaler.bin"
 COLUMNS_PATH = PROJECT_ROOT / "models" / "model_columns.bin"
+MODEL_CONFIG_PATH = PROJECT_ROOT / "models" / "model_config.json"
 RESULTS_DIR = PROJECT_ROOT / "src" / "results"
 
-TARGET_RECALL = 0.90
+TARGET_RECALL = 0.80
 HOLDOUT_SIZE = 0.30
 RANDOM_STATE = 42
 
-
-class Autoencoder(nn.Module):
-    def __init__(self, input_dim, output_neurons_layer, dropout_rate, num_layers):
-        super(Autoencoder, self).__init__()
-
-        encoder_layers = []
-        current_dim = input_dim
-        next_dim = output_neurons_layer
-        self.layer_sizes = []
-        for _ in range(num_layers):
-            encoder_layers.append(nn.Linear(current_dim, next_dim))
-            encoder_layers.append(nn.BatchNorm1d(next_dim))
-            encoder_layers.append(nn.ReLU())
-            encoder_layers.append(nn.Dropout(dropout_rate))
-            self.layer_sizes.append(next_dim)
-            current_dim = next_dim
-            next_dim = max(5, next_dim // 2)
-        self.encoder = nn.Sequential(*encoder_layers)
-
-        decoder_layers = []
-        reverse_sizes = self.layer_sizes[::-1]
-        current_dim = self.layer_sizes[-1]
-        target_sizes = reverse_sizes[1:] + [input_dim]
-        for target_dim in target_sizes:
-            decoder_layers.append(nn.Linear(current_dim, target_dim))
-            if target_dim != num_layers - 1:
-                decoder_layers.append(nn.BatchNorm1d(target_dim))
-                decoder_layers.append(nn.ReLU())
-                decoder_layers.append(nn.Dropout(dropout_rate))
-            current_dim = target_dim
-        self.decoder = nn.Sequential(*decoder_layers)
-
-    def forward(self, x):
-        return self.decoder(self.encoder(x))
+DEFAULT_MODEL_CONFIG = {
+    "start_neurons": 96,
+    "dropout": 0.1,
+    "num_layers": 1,
+}
 
 
-def build_feature_matrix(df: pd.DataFrame, scaler, feature_columns: pd.Index) -> np.ndarray:
-    num_cols = ["amount", "oldBalanceOrg", "newBalanceOrg", "oldBalanceDest", "newBalanceDest"]
-    cat_cols = ["type", "currency", "originBank", "originCountry", "destBank", "destCountry"]
+def _load_model_config() -> dict:
+    if not MODEL_CONFIG_PATH.exists():
+        return DEFAULT_MODEL_CONFIG.copy()
 
-    work_df = df.copy()
-    work_df["amount"] = work_df["amount"].astype(str).str.replace(",", "", regex=False).astype(float)
-    work_df["originBank"] = work_df["originBank"].astype(str).str.upper()
-    work_df.fillna("UNKNOWN", inplace=True)
-
-    encoded = pd.get_dummies(work_df[cat_cols], drop_first=True)
-    feature_df = encoded.copy()
-    for col_name in num_cols:
-        feature_df[col_name] = work_df[col_name].astype(float)
-
-    feature_df = feature_df.reindex(columns=feature_columns, fill_value=0.0)
-    feature_df[num_cols] = scaler.transform(feature_df[num_cols])
-    return feature_df.apply(pd.to_numeric, errors="coerce").fillna(0.0).to_numpy(dtype="float32")
+    payload = json.loads(MODEL_CONFIG_PATH.read_text(encoding="utf-8"))
+    merged = DEFAULT_MODEL_CONFIG.copy()
+    merged.update(payload)
+    return merged
 
 
-def compute_scores(model: nn.Module, feature_matrix: np.ndarray) -> np.ndarray:
+def _torch_load_state_dict(path: Path):
+    try:
+        return torch.load(path, map_location=torch.device("cpu"), weights_only=True)
+    except TypeError:
+        return torch.load(path, map_location=torch.device("cpu"))
+
+
+def compute_scores(model: Autoencoder, feature_matrix: np.ndarray) -> np.ndarray:
     with torch.no_grad():
         tensor_data = torch.from_numpy(feature_matrix)
         reconstructions = model(tensor_data)
@@ -95,7 +72,6 @@ def compute_scores(model: nn.Module, feature_matrix: np.ndarray) -> np.ndarray:
 
 
 def load_scaler_with_refresh(path: Path):
-    # If sklearn version changed, load once and re-save to current runtime version.
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always", InconsistentVersionWarning)
         scaler = joblib.load(path)
@@ -136,35 +112,40 @@ def sweep_thresholds(y_true: np.ndarray, scores: np.ndarray, target_recall: floa
     return float(selected["threshold"]), sweep_df
 
 
-def main():
+def main() -> None:
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    if not DATA_PATH.exists():
-        raise FileNotFoundError(f"Dataset not found: {DATA_PATH}")
+    required_paths = [DATA_PATH, MODEL_PATH, SCALER_PATH, COLUMNS_PATH]
+    for path in required_paths:
+        if not path.exists():
+            raise FileNotFoundError(f"Required file not found: {path}")
 
     df = pd.read_csv(DATA_PATH)
     if "is_anomaly" not in df.columns:
         raise ValueError("Dataset must include `is_anomaly` column for evaluation")
 
-    eval_df = df.copy()
-    y = eval_df["is_anomaly"].astype(int)
-
-    # This creates a holdout split for evaluation artifacts.
+    y = df["is_anomaly"].astype(int)
     _, holdout_idx = train_test_split(
-        np.arange(len(eval_df)), test_size=HOLDOUT_SIZE, random_state=RANDOM_STATE, stratify=y
+        np.arange(len(df)), test_size=HOLDOUT_SIZE, random_state=RANDOM_STATE, stratify=y
     )
-    holdout_df = eval_df.iloc[holdout_idx].copy().reset_index(drop=True)
+
+    holdout_df = df.iloc[holdout_idx].copy().reset_index(drop=True)
     y_holdout = holdout_df["is_anomaly"].astype(int).to_numpy()
 
     scaler = load_scaler_with_refresh(SCALER_PATH)
     feature_columns = joblib.load(COLUMNS_PATH)
 
-    feature_matrix = build_feature_matrix(holdout_df, scaler, feature_columns)
+    feature_df = transform_with_artifacts(holdout_df, scaler, feature_columns)
+    feature_matrix = feature_df.to_numpy(dtype="float32")
 
+    model_config = _load_model_config()
     model = Autoencoder(
-        input_dim=len(feature_columns), output_neurons_layer=96, dropout_rate=0.1, num_layers=1
+        input_dim=len(feature_columns),
+        output_neurons_layer=int(model_config["start_neurons"]),
+        dropout_rate=float(model_config["dropout"]),
+        num_layers=int(model_config["num_layers"]),
     )
-    model.load_state_dict(torch.load(MODEL_PATH, map_location=torch.device("cpu"), weights_only=True))
+    model.load_state_dict(_torch_load_state_dict(MODEL_PATH))
     model.eval()
 
     scores = compute_scores(model, feature_matrix)
@@ -189,6 +170,7 @@ def main():
         "method": "recall_constrained",
         "target_recall": TARGET_RECALL,
         "selected_threshold": float(selected_threshold),
+        "high_risk_multiplier": 1.5,
         "holdout_size": HOLDOUT_SIZE,
         "random_state": RANDOM_STATE,
     }
@@ -213,7 +195,17 @@ def main():
         },
     }
 
-    scored_df = holdout_df[["transactionId", "timestamp", "type", "amount", "originCountry", "destCountry", "is_anomaly"]].copy()
+    display_cols = [
+        "transactionId",
+        "timestamp",
+        "type",
+        "amount",
+        "originCountry",
+        "destCountry",
+        "is_anomaly",
+    ]
+    display_cols = [col for col in display_cols if col in holdout_df.columns]
+    scored_df = holdout_df[display_cols].copy()
     scored_df["anomaly_score"] = scores
     scored_df["predicted_label"] = y_pred
 
@@ -227,7 +219,8 @@ def main():
         "## Threshold Selection\n"
         f"- Method: recall-constrained\n"
         f"- Target recall: {TARGET_RECALL:.2f}\n"
-        f"- Selected threshold: {selected_threshold:.6f}\n\n"
+        f"- Selected threshold: {selected_threshold:.6f}\n"
+        f"- High-risk threshold: {selected_threshold * 1.5:.6f}\n\n"
         "## Metrics (Holdout)\n"
         f"- Precision: {precision:.4f}\n"
         f"- Recall: {recall:.4f}\n"
@@ -253,3 +246,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

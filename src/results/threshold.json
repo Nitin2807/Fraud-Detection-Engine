@@ -1,7 +1,8 @@
 {
   "method": "recall_constrained",
-  "target_recall": 0.9,
-  "selected_threshold": 0.16005970943786338,
+  "target_recall": 0.8,
+  "selected_threshold": 0.003111642699516963,
+  "high_risk_multiplier": 1.5,
   "holdout_size": 0.3,
   "random_state": 42
 }

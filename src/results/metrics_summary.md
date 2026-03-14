@@ -2,19 +2,20 @@
 
 ## Threshold Selection
 - Method: recall-constrained
-- Target recall: 0.90
-- Selected threshold: 0.160060
+- Target recall: 0.80
+- Selected threshold: 0.003112
+- High-risk threshold: 0.004667
 
 ## Metrics (Holdout)
-- Precision: 0.0494
-- Recall: 0.9394
-- F1: 0.0938
-- Accuracy: 0.1131
-- PR-AUC: 0.2401
-- ROC-AUC: 0.5943
+- Precision: 0.9751
+- Recall: 0.8012
+- F1: 0.8796
+- Accuracy: 0.9888
+- PR-AUC: 0.8353
+- ROC-AUC: 0.9214
 
 ## Confusion Matrix
-- TN: 2177
-- FP: 28639
-- FN: 96
-- TP: 1488
+- TN: 30706
+- FP: 34
+- FN: 330
+- TP: 1330
